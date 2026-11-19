@@ -1,17 +1,9 @@
 import json
-import os
-
+import joblib
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
-
-try:
-    os.environ.setdefault("API_BASE_URL", st.secrets["API_BASE_URL"])
-except (KeyError, StreamlitSecretNotFoundError):
-    pass
-
-from api_client import API_BASE_URL, ApiError, get_health, get_model_info, predict, predict_batch
+from pathlib import Path
 from ui_helpers import (
     CATEGORICAL_OPTIONS,
     FEATURE_COLUMNS,
@@ -39,23 +31,71 @@ RETAIN_COLOR = "#067647"
 NEUTRAL_COLOR = "#667085"
 ACCENT_COLOR = "#2563EB"
 
-
-@st.cache_data(ttl=15, show_spinner=False)
-def cached_health() -> dict:
-    return get_health()
+MODEL_PATH = Path(__file__).resolve().parent / "churn_predictor.joblib"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_model_info() -> dict:
-    return get_model_info()
+@st.cache_resource
+def load_model_artifact() -> dict:
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model file not found: {MODEL_PATH.name}. Run train.py first."
+        )
+    return joblib.load(MODEL_PATH)
+
+
+def get_model_info() -> dict:
+    artifact = load_model_artifact()
+    return {
+        "model_name": artifact["model_name"],
+        "threshold": artifact["threshold"],
+        "feature_columns": artifact["feature_columns"],
+        "numeric_columns": artifact["numeric_columns"],
+        "categorical_columns": artifact["categorical_columns"],
+        "best_params": artifact["best_params"],
+        "cv_f1": artifact["cv_f1"],
+        "test_metrics": artifact["test_metrics"],
+        "training_rows": artifact["training_rows"],
+        "test_rows": artifact["test_rows"],
+    }
+
+
+def predict(record: dict) -> dict:
+    artifact = load_model_artifact()
+    frame = pd.DataFrame([record])[artifact["feature_columns"]]
+    probabilities = artifact["model"].predict_proba(frame)[:, artifact["churn_class_index"]]
+    probability = float(probabilities[0])
+    threshold = artifact["threshold"]
+    prediction = int(probability >= threshold)
+    return {
+        "prediction": prediction,
+        "label": "Churned" if prediction == 1 else "Not Churned",
+        "churn_probability": round(probability, 4),
+        "threshold": threshold,
+    }
+
+
+def predict_batch(records: list[dict]) -> list[dict]:
+    artifact = load_model_artifact()
+    frame = pd.DataFrame(records)[artifact["feature_columns"]]
+    probabilities = artifact["model"].predict_proba(frame)[:, artifact["churn_class_index"]]
+    threshold = artifact["threshold"]
+    results = []
+    for probability in probabilities:
+        value = float(probability)
+        prediction = int(value >= threshold)
+        results.append({
+            "prediction": prediction,
+            "label": "Churned" if prediction == 1 else "Not Churned",
+            "churn_probability": round(value, 4),
+            "threshold": threshold,
+        })
+    return results
 
 
 def render_connection_help() -> None:
     st.markdown(
-        "The prediction service is not responding. Try again in a moment. If the problem "
-        "continues, contact the administrator."
+        "The local model could not be loaded. Run `python train.py` and refresh the page."
     )
-    st.caption(f"Configured API address: {API_BASE_URL}")
 
 
 def render_sidebar() -> str:
@@ -65,10 +105,10 @@ def render_sidebar() -> str:
         page = st.radio("Navigation", PAGES, label_visibility="collapsed")
         st.divider()
         try:
-            cached_health()
-            st.success("API connected")
-        except ApiError:
-            st.error("API unreachable")
+            load_model_artifact()
+            st.success("Model loaded")
+        except Exception:
+            st.error("Model unavailable")
     return page
 
 
@@ -97,25 +137,26 @@ def build_metrics_chart(test_metrics: dict) -> go.Figure:
 def render_overview() -> None:
     st.title("Overview")
     st.caption(
-        "Live status from the prediction API. Model metrics are saved training and "
+        "Live status from the local prediction model. Model metrics are saved training and "
         "evaluation results, not live production metrics."
     )
 
     try:
-        health = cached_health()
-    except ApiError as err:
-        st.error(f"API connection failed. {err.message}")
+        load_model_artifact()
+        health = {"model_loaded": True}
+    except Exception as err:
+        st.error(f"Model could not be loaded. {err}")
         render_connection_help()
         return
 
     try:
-        info = cached_model_info()
-    except ApiError as err:
-        st.error(err.message)
+        info = get_model_info()
+    except Exception as err:
+        st.error(str(err))
         return
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("API status", "Connected")
+    col1.metric("Model status", "Loaded")
     col2.metric("Active model", info["model_name"])
     col3.metric("Input features", len(info["feature_columns"]))
     col4.metric("Decision threshold", f"{info['threshold']:.0%}")
@@ -237,21 +278,14 @@ def render_prediction(result: dict) -> None:
     st.caption(f"Backend label: {result['label']}")
 
 
-def render_predict_error(err: ApiError) -> None:
-    if err.kind in ("connection", "timeout"):
-        st.error(f"API connection failed. {err.message}")
-        render_connection_help()
-    elif err.kind == "invalid_input":
-        st.error("The backend rejected these inputs. Review the form and try again.")
-    elif err.kind == "http":
-        st.error(f"Prediction failed on the backend. No result was produced. {err.message}")
-    else:
-        st.error(err.message)
+def render_predict_error(err: Exception) -> None:
+    st.error(f"Prediction failed. {err}")
+    render_connection_help()
 
 
 def render_predict_page() -> None:
     st.title("Predict churn")
-    st.caption("Enter one customer's details. The prediction is returned by the backend model.")
+    st.caption("Enter one customer's details. The saved model creates the prediction.")
 
     values: dict = {}
     with st.form("customer_form"):
@@ -267,9 +301,9 @@ def render_predict_page() -> None:
         return
 
     try:
-        with st.spinner("Requesting prediction from the backend..."):
+        with st.spinner("Running prediction..."):
             result = predict(build_record(values))
-    except ApiError as err:
+    except Exception as err:
         render_predict_error(err)
         return
 
@@ -278,7 +312,7 @@ def render_predict_page() -> None:
 
 def run_batch_predictions(df: pd.DataFrame) -> list[dict]:
     records = json.loads(df[FEATURE_COLUMNS].to_json(orient="records"))
-    progress = st.progress(0.0, text="Requesting predictions...")
+    progress = st.progress(0.0, text="Running predictions...")
     predictions: list[dict] = []
     for start in range(0, len(records), BATCH_SIZE):
         chunk = records[start:start + BATCH_SIZE]
@@ -307,7 +341,7 @@ def render_batch_results(frame: pd.DataFrame) -> None:
 
 def render_batch_page() -> None:
     st.title("Batch predictions")
-    st.caption("Upload customers as a CSV. Predictions come from the backend's /predict/batch endpoint.")
+    st.caption("Upload customers as a CSV. The saved model scores every row.")
 
     st.download_button(
         "Download CSV template",
@@ -346,11 +380,11 @@ def render_batch_page() -> None:
         if st.button("Run batch predictions", type="primary"):
             try:
                 predictions = run_batch_predictions(df)
-            except ApiError as err:
+            except Exception as err:
                 st.session_state.pop("batch_result", None)
                 st.error(
                     "Batch prediction failed. No results are shown because the run is incomplete. "
-                    f"{err.message}"
+                    f"{err}"
                 )
                 return
             result = df.copy()
@@ -368,12 +402,12 @@ def render_batch_page() -> None:
 
 def render_model_page() -> None:
     st.title("Model information")
-    st.caption("Only information returned by the backend is shown here.")
+    st.caption("Training and evaluation information from the saved model artifact.")
 
     try:
-        info = cached_model_info()
-    except ApiError as err:
-        st.error(f"API connection failed. {err.message}")
+        info = get_model_info()
+    except Exception as err:
+        st.error(f"Model could not be loaded. {err}")
         render_connection_help()
         return
 
